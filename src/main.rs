@@ -488,9 +488,10 @@ async fn update_entries_cache<'c>(
 
 async fn get_notes(
     extract::State(state): extract::State<AppState>,
-) -> Json<Vec<ListEntry>> {
+) -> Result<Json<Vec<ListEntry>>, AppError> {
     debug!("get_notes");
-    Json(state.get_entries(None).await.unwrap().1)
+    let (_, entries) = state.get_entries(None).await?;
+    Ok(Json(entries))
 }
 
 async fn find_entry_blob(
@@ -1076,29 +1077,29 @@ mod v2 {
         extract::Query(query): extract::Query<TaskQuery>,
         extract::State(state): extract::State<AppState>,
         headers: HeaderMap,
-    ) -> Response {
+    ) -> Result<Response, AppError> {
         debug!("v2::get_tasks");
 
         // Load task entries
-        let (head_commit_id, entries) = state.get_entries(Some(".tasks/*")).await.unwrap();
+        let (head_commit_id, entries) = state.get_entries(Some(".tasks/*")).await?;
 
         // Check If-None-Match header, and shortcut to 304
         let etag_value = format!("\"{}\"", head_commit_id);
         if let Some(inm) = headers.get(header::IF_NONE_MATCH) {
             if inm.to_str().unwrap_or("") == etag_value {
-                return Response::builder()
+                return Ok(Response::builder()
                     .status(StatusCode::NOT_MODIFIED)
                     .header(header::ETAG, etag_value.clone())
                     .header(header::ACCESS_CONTROL_EXPOSE_HEADERS, "ETag")
                     .body(Body::empty())
-                    .unwrap();
+                    .map_err(AppError::from)?);
             }
         }
 
-        match query.format.as_deref() {
+        let response = match query.format.as_deref() {
             Some("tree") => {
                 // Tree structure response
-                let roots = entries_to_tree(&entries, Some(".tasks")).unwrap();
+                let roots = entries_to_tree(&entries, Some(".tasks"))?;
                 let response = Json(roots).into_response();
                 attach_oid(response, head_commit_id)
             },
@@ -1107,34 +1108,35 @@ mod v2 {
                 let response = Json(entries).into_response();
                 attach_oid(response, head_commit_id)
             },
-        }
+        };
+        Ok(response)
     }
 
     pub async fn get_events(
         extract::State(state): extract::State<AppState>,
         headers: HeaderMap,
-    ) -> Response {
+    ) -> Result<Response, AppError> {
         debug!("v2::get_events");
 
         // Load event entries
-        let (head_commit_id, entries) = state.get_entries(Some(".events/*")).await.unwrap();
+        let (head_commit_id, entries) = state.get_entries(Some(".events/*")).await?;
 
         // Check If-None-Match header, and shortcut to 304
         let etag_value = format!("\"{}\"", head_commit_id);
         if let Some(inm) = headers.get(header::IF_NONE_MATCH) {
             if inm.to_str().unwrap_or("") == etag_value {
-                return Response::builder()
+                return Ok(Response::builder()
                     .status(StatusCode::NOT_MODIFIED)
                     .header(header::ETAG, etag_value.clone())
                     .header(header::ACCESS_CONTROL_EXPOSE_HEADERS, "ETag")
                     .body(Body::empty())
-                    .unwrap();
+                    .map_err(AppError::from)?);
             }
         }
 
         // Normal response
         let response = Json(entries).into_response();
-        attach_oid(response, head_commit_id)
+        Ok(attach_oid(response, head_commit_id))
     }
 }
 
