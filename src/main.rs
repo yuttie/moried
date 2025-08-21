@@ -98,24 +98,29 @@ async fn main() -> Result<()> {
         .await?;
 
     let repo = {
-        let git_dir = env::var("MORIED_GIT_DIR").unwrap();
-        match Repository::open(git_dir) {
-            Ok(repo) => repo,
-            Err(e) => panic!("failed to open: {}", e),
-        }
+        let git_dir = env::var("MORIED_GIT_DIR")
+            .context("MORIED_GIT_DIR environment variable not set")?;
+        Repository::open(git_dir)
+            .context("Failed to open git repository")?
     };
     let state = models::AppState {
         repo: Arc::new(Mutex::new(repo)),
         cache_db: db_pool,
     };
 
-    let addr = env::var("MORIED_LISTEN").unwrap();
+    let addr = env::var("MORIED_LISTEN")
+        .context("MORIED_LISTEN environment variable not set")?;
     debug!("{:?}", addr);
 
     let cors = CorsLayer::new()
         .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
         .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE, header::IF_NONE_MATCH])
-        .allow_origin(env::var("MORIED_ORIGIN_ALLOWED").unwrap().parse::<HeaderValue>().unwrap())
+        .allow_origin(
+            env::var("MORIED_ORIGIN_ALLOWED")
+                .context("MORIED_ORIGIN_ALLOWED environment variable not set")?
+                .parse::<HeaderValue>()
+                .context("Invalid header value for MORIED_ORIGIN_ALLOWED")?
+        )
         .allow_credentials(true);
 
     let protected_api = Router::new()
@@ -158,7 +163,8 @@ async fn main() -> Result<()> {
         );
 
     let app = {
-        let root_path = env::var("MORIED_ROOT_PATH").unwrap();
+        let root_path = env::var("MORIED_ROOT_PATH")
+            .context("MORIED_ROOT_PATH environment variable not set")?;
         assert!(root_path.starts_with('/'), "MORIED_ROOT_PATH must start with '/'");
         assert!(root_path.ends_with('/'), "MORIED_ROOT_PATH must end with '/'");
 
@@ -170,10 +176,11 @@ async fn main() -> Result<()> {
         }
     };
 
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(addr).await
+        .context("Failed to bind TCP listener")?;
     axum::serve(listener, app.into_make_service())
         .await
-        .unwrap();
+        .context("Failed to start server")?;
 
     Ok(())
 }
