@@ -193,9 +193,22 @@ async fn auth(req: Request<Body>, next: Next) -> Result<Response, StatusCode> {
 }
 
 fn token_is_valid(header_value: &str) -> bool {
-    let token = header_value.split_whitespace().nth(1).unwrap();
+    let token = match header_value.split_whitespace().nth(1) {
+        Some(token) => token,
+        None => {
+            debug!("failed to extract token from authorization header");
+            return false;
+        }
+    };
 
-    let secret = env::var("MORIED_SECRET").unwrap();
+    let secret = match env::var("MORIED_SECRET") {
+        Ok(secret) => secret,
+        Err(_) => {
+            debug!("MORIED_SECRET environment variable not set");
+            return false;
+        }
+    };
+    
     match jwt::decode::<Claims>(&token, &jwt::DecodingKey::from_secret(secret.as_ref()), &jwt::Validation::default()) {
         Ok(_) => {
             debug!("authorized");
@@ -210,18 +223,25 @@ fn token_is_valid(header_value: &str) -> bool {
 
 async fn post_login(
     Json(login): Json<Login>,
-) -> Response {
+) -> Result<Response, AppError> {
     debug!("post_login");
-    let user_name = env::var("MORIED_USER_NAME").unwrap();
-    let user_email = env::var("MORIED_USER_EMAIL").unwrap();
-    let user_hash = env::var("MORIED_USER_HASH").unwrap();
-    let matches = user_name == login.user && argon2::verify_encoded(&user_hash, login.password.as_ref()).unwrap();
+    let user_name = env::var("MORIED_USER_NAME")
+        .map_err(|_| anyhow::anyhow!("MORIED_USER_NAME environment variable not set"))?;
+    let user_email = env::var("MORIED_USER_EMAIL")
+        .map_err(|_| anyhow::anyhow!("MORIED_USER_EMAIL environment variable not set"))?;
+    let user_hash = env::var("MORIED_USER_HASH")
+        .map_err(|_| anyhow::anyhow!("MORIED_USER_HASH environment variable not set"))?;
+    let matches = user_name == login.user && argon2::verify_encoded(&user_hash, login.password.as_ref())
+        .map_err(|e| anyhow::anyhow!("Password verification failed: {}", e))?;
 
     if matches {
-        let secret = env::var("MORIED_SECRET").unwrap();
-        let duration = env::var("MORIED_SESSION_DURATION").map_or(Duration::hours(6), |v| {
-            Duration::minutes(v.parse::<i64>().expect("Session duration in minutes represented as integer value is expected"))
-        });
+        let secret = env::var("MORIED_SECRET")
+            .map_err(|_| anyhow::anyhow!("MORIED_SECRET environment variable not set"))?;
+        let duration = match env::var("MORIED_SESSION_DURATION") {
+            Ok(v) => Duration::minutes(v.parse::<i64>()
+                .map_err(|_| anyhow::anyhow!("Session duration must be an integer value in minutes"))?),
+            Err(_) => Duration::hours(6),
+        };
         let now: DateTime<Utc> = Utc::now();
         let my_claims = Claims {
             sub: login.user.to_owned(),
@@ -232,11 +252,11 @@ async fn post_login(
             &jwt::Header::default(),
             &my_claims,
             &jwt::EncodingKey::from_secret(secret.as_ref())
-        ).unwrap();
-        token.into_response()
+        ).map_err(|e| anyhow::anyhow!("Failed to encode JWT token: {}", e))?;
+        Ok(token.into_response())
     }
     else {
-        StatusCode::UNAUTHORIZED.into_response()
+        Ok(StatusCode::UNAUTHORIZED.into_response())
     }
 }
 
@@ -556,22 +576,29 @@ async fn put_notes_path(
     extract::Path(path): extract::Path<String>,
     extract::State(state): extract::State<AppState>,
     Json(note_save): Json<NoteSave>,
-) -> Response {
+) -> Result<Response, AppError> {
     debug!("put_notes_path");
     debug!("{:?}", note_save);
 
     match note_save {
         NoteSave::Save { content, message } => {
-            let repo = state.repo.lock().unwrap();
+            let repo = state.repo.lock()
+                .map_err(|_| anyhow::anyhow!("Failed to acquire repository lock"))?;
 
-            let head = repo.head().unwrap();
-            let head_tree = head.peel_to_tree().unwrap();
-            let head_commit = head.peel_to_commit().unwrap();
+            let head = repo.head()
+                .map_err(|e| anyhow::anyhow!("Failed to get HEAD reference: {}", e))?;
+            let head_tree = head.peel_to_tree()
+                .map_err(|e| anyhow::anyhow!("Failed to get HEAD tree: {}", e))?;
+            let head_commit = head.peel_to_commit()
+                .map_err(|e| anyhow::anyhow!("Failed to get HEAD commit: {}", e))?;
 
-            let mut index = Index::new().unwrap();
-            index.read_tree(&head_tree).unwrap();
+            let mut index = Index::new()
+                .map_err(|e| anyhow::anyhow!("Failed to create new index: {}", e))?;
+            index.read_tree(&head_tree)
+                .map_err(|e| anyhow::anyhow!("Failed to read tree into index: {}", e))?;
 
-            let blob_oid = repo.blob(content.as_bytes()).unwrap();
+            let blob_oid = repo.blob(content.as_bytes())
+                .map_err(|e| anyhow::anyhow!("Failed to create blob: {}", e))?;
             let entry = IndexEntry {
                 ctime: IndexTime::new(0, 0),
                 mtime: IndexTime::new(0, 0),
@@ -586,12 +613,16 @@ async fn put_notes_path(
                 flags_extended: 0,
                 path: path.as_bytes().into(),
             };
-            index.add(&entry).unwrap();
+            index.add(&entry)
+                .map_err(|e| anyhow::anyhow!("Failed to add entry to index: {}", e))?;
 
-            let tree_oid = index.write_tree_to(&repo).unwrap();
-            let tree = repo.find_tree(tree_oid).unwrap();
+            let tree_oid = index.write_tree_to(&repo)
+                .map_err(|e| anyhow::anyhow!("Failed to write tree: {}", e))?;
+            let tree = repo.find_tree(tree_oid)
+                .map_err(|e| anyhow::anyhow!("Failed to find tree: {}", e))?;
 
-            let signature = repo.signature().unwrap();
+            let signature = repo.signature()
+                .map_err(|e| anyhow::anyhow!("Failed to create signature: {}", e))?;
             repo.commit(
                 Some("HEAD"),
                 &signature,
@@ -599,42 +630,46 @@ async fn put_notes_path(
                 &message,
                 &tree,
                 &[&head_commit],
-            ).unwrap();
-            Json(&true).into_response()
+            ).map_err(|e| anyhow::anyhow!("Failed to create commit: {}", e))?;
+            Ok(Json(&true).into_response())
         },
         NoteSave::Rename { from } => {
-            let found = {
-                let repo = state.repo.lock().unwrap();
+            let repo = state.repo.lock()
+                .map_err(|_| anyhow::anyhow!("Failed to acquire repository lock"))?;
 
-                let head = repo.head().unwrap();
-                let head_tree = head.peel_to_tree().unwrap();
+            let head = repo.head()
+                .map_err(|e| anyhow::anyhow!("Failed to get HEAD reference: {}", e))?;
+            let head_tree = head.peel_to_tree()
+                .map_err(|e| anyhow::anyhow!("Failed to get HEAD tree: {}", e))?;
 
-                let mut index = Index::new().unwrap();
-                index.read_tree(&head_tree).unwrap();
+            let mut index = Index::new()
+                .map_err(|e| anyhow::anyhow!("Failed to create new index: {}", e))?;
+            index.read_tree(&head_tree)
+                .map_err(|e| anyhow::anyhow!("Failed to read tree into index: {}", e))?;
 
-                index.iter().find(|entry| std::str::from_utf8(&entry.path).unwrap() == from)
-            };
-            if let Some(mut entry) = found {
-                let repo = state.repo.lock().unwrap();
+            if let Some(mut entry) = index.iter().find(|entry| {
+                std::str::from_utf8(&entry.path).unwrap_or("") == from
+            }) {
+                let head_commit = head.peel_to_commit()
+                    .map_err(|e| anyhow::anyhow!("Failed to get HEAD commit: {}", e))?;
 
-                let head = repo.head().unwrap();
-                let head_tree = head.peel_to_tree().unwrap();
-                let head_commit = head.peel_to_commit().unwrap();
+                let from_path = std::str::from_utf8(&entry.path)
+                    .map_err(|e| anyhow::anyhow!("Invalid UTF-8 in path: {}", e))?;
+                index.remove(Path::new(from_path), 0)
+                    .map_err(|e| anyhow::anyhow!("Failed to remove entry from index: {}", e))?;
 
-                let mut index = Index::new().unwrap();
-                index.read_tree(&head_tree).unwrap();
-
-                let from = std::str::from_utf8(&entry.path).unwrap();
-                index.remove(from.as_ref(), 0).unwrap();
-
-                let message = format!("Rename {} to {}", &from, &path);
+                let message = format!("Rename {} to {}", &from_path, &path);
                 entry.path = path.as_bytes().into();
-                index.add(&entry).unwrap();
+                index.add(&entry)
+                    .map_err(|e| anyhow::anyhow!("Failed to add entry to index: {}", e))?;
 
-                let tree_oid = index.write_tree_to(&repo).unwrap();
-                let tree = repo.find_tree(tree_oid).unwrap();
+                let tree_oid = index.write_tree_to(&repo)
+                    .map_err(|e| anyhow::anyhow!("Failed to write tree: {}", e))?;
+                let tree = repo.find_tree(tree_oid)
+                    .map_err(|e| anyhow::anyhow!("Failed to find tree: {}", e))?;
 
-                let signature = repo.signature().unwrap();
+                let signature = repo.signature()
+                    .map_err(|e| anyhow::anyhow!("Failed to create signature: {}", e))?;
                 repo.commit(
                     Some("HEAD"),
                     &signature,
@@ -642,11 +677,11 @@ async fn put_notes_path(
                     &message,
                     &tree,
                     &[&head_commit],
-                ).unwrap();
-                Json(&true).into_response()
+                ).map_err(|e| anyhow::anyhow!("Failed to create commit: {}", e))?;
+                Ok(Json(&true).into_response())
             }
             else {
-                StatusCode::NOT_FOUND.into_response()
+                Ok(StatusCode::NOT_FOUND.into_response())
             }
         },
     }
@@ -655,37 +690,40 @@ async fn put_notes_path(
 async fn delete_notes_path(
     extract::Path(path): extract::Path<String>,
     extract::State(state): extract::State<AppState>,
-) -> Response {
+) -> Result<Response, AppError> {
     debug!("delete_notes_path");
 
-    let found = {
-        let repo = state.repo.lock().unwrap();
+    let repo = state.repo.lock()
+        .map_err(|_| anyhow::anyhow!("Failed to acquire repository lock"))?;
 
-        let head = repo.head().unwrap();
-        let head_tree = head.peel_to_tree().unwrap();
+    let head = repo.head()
+        .map_err(|e| anyhow::anyhow!("Failed to get HEAD reference: {}", e))?;
+    let head_tree = head.peel_to_tree()
+        .map_err(|e| anyhow::anyhow!("Failed to get HEAD tree: {}", e))?;
 
-        let mut index = Index::new().unwrap();
-        index.read_tree(&head_tree).unwrap();
+    let mut index = Index::new()
+        .map_err(|e| anyhow::anyhow!("Failed to create new index: {}", e))?;
+    index.read_tree(&head_tree)
+        .map_err(|e| anyhow::anyhow!("Failed to read tree into index: {}", e))?;
 
-        index.iter().find(|entry| std::str::from_utf8(&entry.path).unwrap() == path)
-    };
-    if let Some(entry) = found {
-        let repo = state.repo.lock().unwrap();
+    if let Some(entry) = index.iter().find(|entry| {
+        std::str::from_utf8(&entry.path).unwrap_or("") == path
+    }) {
+        let head_commit = head.peel_to_commit()
+            .map_err(|e| anyhow::anyhow!("Failed to get HEAD commit: {}", e))?;
 
-        let head = repo.head().unwrap();
-        let head_tree = head.peel_to_tree().unwrap();
-        let head_commit = head.peel_to_commit().unwrap();
+        let entry_path = std::str::from_utf8(&entry.path)
+            .map_err(|e| anyhow::anyhow!("Invalid UTF-8 in path: {}", e))?;
+        index.remove(Path::new(entry_path), 0)
+            .map_err(|e| anyhow::anyhow!("Failed to remove entry from index: {}", e))?;
 
-        let mut index = Index::new().unwrap();
-        index.read_tree(&head_tree).unwrap();
+        let tree_oid = index.write_tree_to(&repo)
+            .map_err(|e| anyhow::anyhow!("Failed to write tree: {}", e))?;
+        let tree = repo.find_tree(tree_oid)
+            .map_err(|e| anyhow::anyhow!("Failed to find tree: {}", e))?;
 
-        let path = std::str::from_utf8(&entry.path).unwrap();
-        index.remove(path.as_ref(), 0).unwrap();
-
-        let tree_oid = index.write_tree_to(&repo).unwrap();
-        let tree = repo.find_tree(tree_oid).unwrap();
-
-        let signature = repo.signature().unwrap();
+        let signature = repo.signature()
+            .map_err(|e| anyhow::anyhow!("Failed to create signature: {}", e))?;
         repo.commit(
             Some("HEAD"),
             &signature,
@@ -693,11 +731,11 @@ async fn delete_notes_path(
             &format!("Delete {}", &path),
             &tree,
             &[&head_commit],
-        ).unwrap();
-        Json(&true).into_response()
+        ).map_err(|e| anyhow::anyhow!("Failed to create commit: {}", e))?;
+        Ok(Json(&true).into_response())
     }
     else {
-        StatusCode::NOT_FOUND.into_response()
+        Ok(StatusCode::NOT_FOUND.into_response())
     }
 }
 
@@ -781,25 +819,35 @@ async fn get_files_path(
 async fn post_files(
     extract::State(state): extract::State<AppState>,
     mut multipart: extract::Multipart,
-) -> Response {
+) -> Result<Response, AppError> {
     debug!("post_files_path");
 
     // Create a blob for each part (file) in the form data
     let mut files = Vec::new();
     let mut result = Vec::new();
-    while let Some(field) = multipart.next_field().await.unwrap() {
+    while let Some(field) = multipart.next_field().await
+        .map_err(|e| anyhow::anyhow!("Failed to get multipart field: {}", e))? {
         debug!("{:?}", field);
 
-        let uuid = field.name().unwrap().to_owned();
-        let filename = field.file_name().unwrap().as_bytes().to_vec();
+        let uuid = field.name()
+            .ok_or_else(|| anyhow::anyhow!("Field missing name"))?
+            .to_owned();
+        let filename = field.file_name()
+            .ok_or_else(|| anyhow::anyhow!("Field missing filename"))?
+            .as_bytes().to_vec();
 
         let blob_oid = {
-            let data = field.bytes().await.unwrap();
+            let data = field.bytes().await
+                .map_err(|e| anyhow::anyhow!("Failed to read field data: {}", e))?;
 
-            let repo = state.repo.lock().unwrap();
-            let mut writer = repo.blob_writer(None).unwrap();
-            writer.write_all(&data).unwrap();
-            writer.commit().unwrap()
+            let repo = state.repo.lock()
+                .map_err(|_| anyhow::anyhow!("Failed to acquire repository lock"))?;
+            let mut writer = repo.blob_writer(None)
+                .map_err(|e| anyhow::anyhow!("Failed to create blob writer: {}", e))?;
+            writer.write_all(&data)
+                .map_err(|e| anyhow::anyhow!("Failed to write blob data: {}", e))?;
+            writer.commit()
+                .map_err(|e| anyhow::anyhow!("Failed to commit blob: {}", e))?
         };
 
         files.push((filename, blob_oid));
@@ -807,14 +855,20 @@ async fn post_files(
     }
 
     // Commit
-    let repo = state.repo.lock().unwrap();
+    let repo = state.repo.lock()
+        .map_err(|_| anyhow::anyhow!("Failed to acquire repository lock"))?;
 
-    let head = repo.head().unwrap();
-    let head_tree = head.peel_to_tree().unwrap();
-    let head_commit = head.peel_to_commit().unwrap();
+    let head = repo.head()
+        .map_err(|e| anyhow::anyhow!("Failed to get HEAD reference: {}", e))?;
+    let head_tree = head.peel_to_tree()
+        .map_err(|e| anyhow::anyhow!("Failed to get HEAD tree: {}", e))?;
+    let head_commit = head.peel_to_commit()
+        .map_err(|e| anyhow::anyhow!("Failed to get HEAD commit: {}", e))?;
 
-    let mut index = Index::new().unwrap();
-    index.read_tree(&head_tree).unwrap();
+    let mut index = Index::new()
+        .map_err(|e| anyhow::anyhow!("Failed to create new index: {}", e))?;
+    index.read_tree(&head_tree)
+        .map_err(|e| anyhow::anyhow!("Failed to read tree into index: {}", e))?;
 
     let count = files.len();
     for (path, blob_oid) in files {
@@ -832,13 +886,17 @@ async fn post_files(
             flags_extended: 0,
             path: path,
         };
-        index.add(&entry).unwrap();
+        index.add(&entry)
+            .map_err(|e| anyhow::anyhow!("Failed to add entry to index: {}", e))?;
     }
 
-    let tree_oid = index.write_tree_to(&repo).unwrap();
-    let tree = repo.find_tree(tree_oid).unwrap();
+    let tree_oid = index.write_tree_to(&repo)
+        .map_err(|e| anyhow::anyhow!("Failed to write tree: {}", e))?;
+    let tree = repo.find_tree(tree_oid)
+        .map_err(|e| anyhow::anyhow!("Failed to find tree: {}", e))?;
 
-    let signature = repo.signature().unwrap();
+    let signature = repo.signature()
+        .map_err(|e| anyhow::anyhow!("Failed to create signature: {}", e))?;
     repo.commit(
         Some("HEAD"),
         &signature,
@@ -846,9 +904,9 @@ async fn post_files(
         &format!("Upload {} files", count),
         &tree,
         &[&head_commit],
-    ).unwrap();
+    ).map_err(|e| anyhow::anyhow!("Failed to create commit: {}", e))?;
 
-    Json(result).into_response()
+    Ok(Json(result).into_response())
 }
 
 fn get_frontmatter_node(node: &markdown::mdast::Node) -> Option<&markdown::mdast::Node> {
@@ -992,7 +1050,8 @@ mod v2 {
     pub async fn get_commits_head(
         extract::State(state): extract::State<AppState>,
     ) -> Result<Json<String>, AppError> {
-        let repo = state.repo.lock().unwrap();
+        let repo = state.repo.lock()
+            .map_err(|_| anyhow::anyhow!("Failed to acquire repository lock"))?;
         let head = repo.head()?;
         let commit = head.peel_to_commit()?;
         let commit_id = commit.id();
